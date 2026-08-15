@@ -1,0 +1,292 @@
+<title>Phosphor Shell</title>
+<style>
+  /* Single-theme by intent: a CRT is its own visual world. All colors painted explicitly. */
+  :root{
+    --ph:#33ff33;
+    --ph-bright:color-mix(in srgb, var(--ph) 70%, #ffffff);
+    --ph-dim:color-mix(in srgb, var(--ph) 55%, transparent);
+    --ph-faint:color-mix(in srgb, var(--ph) 26%, transparent);
+    --glass:#050505;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    background:#101010;
+    display:flex;align-items:center;justify-content:center;
+    font-family:"Menlo","Consolas","Liberation Mono","Courier New",monospace;
+    padding:1.2vmin;
+  }
+  .crt{
+    position:relative;
+    width:100%;height:100%;
+    background:radial-gradient(ellipse at 50% 45%, color-mix(in srgb, var(--ph) 5%, var(--glass)) 0%, var(--glass) 78%);
+    overflow:hidden;
+  }
+  /* curvature approximation: rounded glass + inset corner falloff */
+  .fx-curve .crt-inner{border-radius:2.4vmin}
+  .fx-curve{border-radius:2.4vmin;box-shadow:inset 0 0 12vmin rgba(0,0,0,.9)}
+  .crt-inner{position:absolute;inset:0;overflow:hidden}
+
+  .term{
+    position:absolute;inset:0;
+    padding:clamp(16px,3vmin,36px);
+    overflow-y:auto;
+    color:var(--ph);
+    font-size:clamp(13px,1.9vmin,18px);
+    line-height:1.4;
+    white-space:pre-wrap;
+    word-break:break-word;
+    scrollbar-width:none;
+  }
+  .term::-webkit-scrollbar{display:none}
+  .term ::selection,.term::selection{background:var(--ph);color:#000}
+
+  /* ---- effect layers ---- */
+  .fx-glow .term{text-shadow:0 0 3px var(--ph-dim),0 0 14px var(--ph-faint)}
+  .fx-aberration .term{text-shadow:1px 0 rgba(255,0,80,.4),-1px 0 rgba(0,140,255,.4)}
+  .fx-glow.fx-aberration .term{
+    text-shadow:0 0 3px var(--ph-dim),0 0 14px var(--ph-faint),
+      1px 0 rgba(255,0,80,.35),-1px 0 rgba(0,140,255,.35);
+  }
+  .scanlines,.vignette,.rollbar{position:absolute;inset:0;pointer-events:none}
+  .scanlines{
+    display:none;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 1px, transparent 1px 3px);
+    mix-blend-mode:multiply;
+  }
+  .fx-scanlines .scanlines{display:block}
+  .vignette{display:none;background:radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.55) 100%)}
+  .fx-vignette .vignette{display:block}
+  .rollbar{
+    display:none;height:22%;inset:auto 0;top:-25%;
+    background:linear-gradient(180deg, transparent, rgba(255,255,255,.04), transparent);
+    animation:roll 9s linear infinite;
+  }
+  .fx-rollbar .rollbar{display:block}
+  @keyframes roll{from{top:-25%}to{top:110%}}
+  .fx-flicker .crt-inner{animation:flicker 3.7s infinite}
+  @keyframes flicker{
+    0%,100%{opacity:1} 4%{opacity:.965} 5%{opacity:1}
+    38%{opacity:.985} 61%{opacity:.94} 63%{opacity:1} 82%{opacity:.975} 84%{opacity:1}
+  }
+
+  .cursor{
+    display:inline-block;width:.62em;height:1.15em;
+    background:var(--ph);vertical-align:text-bottom;
+    animation:blink 1.06s steps(1) infinite;
+  }
+  .fx-glow .cursor{box-shadow:0 0 8px var(--ph-dim)}
+  @keyframes blink{50%{opacity:0}}
+
+  .dim{color:var(--ph-dim)}
+  .bright{color:var(--ph-bright);font-weight:bold}
+
+  /* power-off collapse */
+  .off .crt-inner{animation:shutdown .5s forwards ease-in}
+  @keyframes shutdown{
+    0%{transform:scale(1);filter:brightness(1)}
+    55%{transform:scale(1,.006);filter:brightness(3)}
+    100%{transform:scale(.001,.004);filter:brightness(8);opacity:0}
+  }
+
+  #kb{position:absolute;opacity:0;top:-100px;left:0;width:1px;height:1px}
+
+  @media (prefers-reduced-motion: reduce){
+    .fx-flicker .crt-inner{animation:none}
+    .fx-rollbar .rollbar{display:none}
+    .cursor{animation:none}
+  }
+</style>
+
+<div class="crt fx-glow fx-scanlines fx-vignette fx-curve fx-flicker fx-rollbar fx-aberration" id="crt">
+  <div class="crt-inner">
+    <div class="term" id="term" aria-live="polite"></div>
+    <div class="scanlines"></div>
+    <div class="rollbar"></div>
+    <div class="vignette"></div>
+  </div>
+  <input id="kb" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="terminal input">
+</div>
+
+<script>
+(() => {
+  const crt  = document.getElementById('crt');
+  const term = document.getElementById('term');
+  const kb   = document.getElementById('kb');
+
+  const FX = ['glow','scanlines','vignette','curve','flicker','rollbar','aberration'];
+  const FX_HELP = {
+    glow:'phosphor bloom around the text',
+    scanlines:'horizontal raster lines',
+    vignette:'darkened corners',
+    curve:'rounded glass + edge falloff',
+    flicker:'slight brightness instability',
+    rollbar:'slow brightness band drifting down',
+    aberration:'red/blue color fringing',
+  };
+  const THEMES = { green:'#33ff33', amber:'#ffb000', ice:'#9fd8ff' };
+
+  const PROMPT = 'guest@phosphor:~$ ';
+  let buf = '', history = [], hIdx = -1, live = null, booting = true;
+
+  const el = (cls, text) => {
+    const d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = text ?? '';
+    return d;
+  };
+  const scroll = () => { term.scrollTop = term.scrollHeight; };
+  const print  = (text = '', cls = '') => {
+    text.split('\n').forEach(line => term.insertBefore(el(cls, line), live));
+    scroll();
+  };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function typeLine(text, cls = '', cps = 4) {
+    const d = el(cls, '');
+    term.insertBefore(d, live);
+    for (const ch of text) { d.textContent += ch; scroll(); await sleep(cps); }
+  }
+
+  function renderLive() {
+    live.textContent = '';
+    live.append(PROMPT, buf);
+    const c = document.createElement('span');
+    c.className = 'cursor';
+    live.appendChild(c);
+    scroll();
+  }
+
+  const CMDS = {
+    help() {
+      print(
+`commands:
+  help                 this list
+  about                what you are looking at
+  fx                   list the CRT effect layers
+  fx <name> on|off     toggle one layer (try: fx scanlines off)
+  fx all on|off        everything at once
+  theme <name>         phosphor color: ${Object.keys(THEMES).join(' | ')}
+  echo <text>          say it back
+  date                 current time
+  whoami               who indeed
+  clear                wipe the screen (also ctrl+l)
+  reboot               power-cycle the tube`);
+    },
+    about() {
+      print(
+`This is one working shell plus a stack of independent effect layers.
+The text you read sits at the bottom; above it float scanlines, a
+vignette, a roll bar, and a flicker on the whole frame. Glow and
+color fringing are text-shadows on the type itself.
+
+Toggle layers with 'fx' to see what each one contributes —
+the look is mostly glow + scanlines at low opacity, everything
+else barely perceptible.`);
+    },
+    fx(args) {
+      if (args.length === 0) {
+        print('layer        state  what it does', 'bright');
+        FX.forEach(f => {
+          const on = crt.classList.contains('fx-' + f);
+          print(`${f.padEnd(13)}${(on ? 'on' : 'off').padEnd(7)}${FX_HELP[f]}`);
+        });
+        print("usage: fx <name> on|off — or 'fx all off' to see the naked terminal", 'dim');
+        return;
+      }
+      const [name, state] = args;
+      if (!['on','off'].includes(state)) return print(`fx: expected on|off, got '${state ?? ''}'`);
+      const targets = name === 'all' ? FX : FX.includes(name) ? [name] : null;
+      if (!targets) return print(`fx: no layer named '${name}' — run 'fx' to list them`);
+      targets.forEach(f => crt.classList.toggle('fx-' + f, state === 'on'));
+      print(`${name} → ${state}`);
+    },
+    theme(args) {
+      const t = THEMES[args[0]];
+      if (!t) return print(`theme: pick one of ${Object.keys(THEMES).join(', ')}`);
+      document.documentElement.style.setProperty('--ph', t);
+      print(`phosphor set to ${args[0]}`);
+    },
+    echo(args)  { print(args.join(' ')); },
+    date()      { print(new Date().toString()); },
+    whoami()    { print('guest (aren\'t we all)'); },
+    clear()     { term.querySelectorAll('div:not(:last-child)').forEach(d => d.remove()); },
+    async reboot() {
+      booting = true;
+      crt.classList.add('off');
+      await sleep(900);
+      term.querySelectorAll('div:not(:last-child)').forEach(d => d.remove());
+      crt.classList.remove('off');
+      await boot();
+    },
+    ls()  { print('README.txt'); },
+    cat(args) {
+      if (args[0] === 'README.txt') CMDS.about();
+      else print(`cat: ${args[0] ?? ''}: no such file`);
+    },
+  };
+
+  async function run(input) {
+    const parts = input.trim().split(/\s+/);
+    const cmd = parts[0];
+    if (!cmd) return;
+    history.push(input); hIdx = history.length;
+    if (CMDS[cmd]) await CMDS[cmd](parts.slice(1));
+    else print(`${cmd}: command not found — try 'help'`);
+  }
+
+  async function boot() {
+    live.style.display = 'none';
+    await sleep(350);
+    await typeLine('PHOSPHOR BIOS v2.4', 'bright', 12);
+    await typeLine('64K PHOSPHOR RAM ....... OK', '', 6);
+    await typeLine('DEFLECTION COILS ....... CALIBRATED', '', 6);
+    await typeLine('ELECTRON GUN ........... WARM', '', 6);
+    await sleep(250);
+    print('');
+    await typeLine('PhosphorOS 1.0 — all effect layers are live.', '', 10);
+    await typeLine("Type 'help' to see what you can do, 'fx' to dissect the look.", '', 10);
+    print('');
+    live.style.display = '';
+    booting = false;
+    renderLive();
+  }
+
+  async function submit() {
+    const input = buf;
+    buf = '';
+    live.style.display = 'none';
+    print(PROMPT + input);
+    await run(input);
+    if (!booting) { live.style.display = ''; renderLive(); }
+  }
+
+  document.addEventListener('keydown', async e => {
+    if (booting || e.metaKey) return;
+    if (e.ctrlKey) {
+      if (e.key === 'l') { e.preventDefault(); CMDS.clear(); renderLive(); }
+      if (e.key === 'c') { e.preventDefault(); print(PROMPT + buf + '^C'); buf = ''; renderLive(); }
+      return;
+    }
+    if (e.key === 'Enter')          { e.preventDefault(); await submit(); }
+    else if (e.key === 'Backspace') { e.preventDefault(); buf = buf.slice(0, -1); renderLive(); }
+    else if (e.key === 'ArrowUp')   { e.preventDefault(); if (hIdx > 0) { hIdx--; buf = history[hIdx]; renderLive(); } }
+    else if (e.key === 'ArrowDown') { e.preventDefault();
+      if (hIdx < history.length - 1) { hIdx++; buf = history[hIdx]; } else { hIdx = history.length; buf = ''; }
+      renderLive(); }
+    else if (e.key.length === 1)    { e.preventDefault(); buf += e.key; renderLive(); }
+  });
+
+  /* mobile soft keyboards type into the hidden input instead of firing key events */
+  kb.addEventListener('input', () => {
+    if (!booting && kb.value) { buf += kb.value; renderLive(); }
+    kb.value = '';
+  });
+  document.addEventListener('click', () => kb.focus({ preventScroll: true }));
+
+  live = el('', '');
+  term.appendChild(live);
+  kb.focus({ preventScroll: true });
+  boot();
+})();
+</script>
